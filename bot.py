@@ -1,97 +1,183 @@
 import ccxt, pandas as pd, requests, os, io, time
 import matplotlib.pyplot as plt
 from datetime import datetime
-import traceback
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 def send_text(msg):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=15)
-        print(f"TG send {r.status_code}: {r.text[:300]}")
-        return r.status_code == 200
-    except Exception as e:
-        print(f"TG FAIL {e}")
-        return False
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                  data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
 
-print("=== BOT START ===")
-print(f"BOT_TOKEN exists: {bool(BOT_TOKEN)} len {len(BOT_TOKEN) if BOT_TOKEN else 0}")
-print(f"CHAT_ID: {CHAT_ID}")
+def send_photo(fig, caption):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=160, bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    requests.post(url, data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+                  files={"photo": buf})
 
-# TEST TELEGRAM FIRST - YOU WILL RECEIVE THIS
-if not BOT_TOKEN or not CHAT_ID:
-    print("ERROR: Secrets missing! Go to Repo > Settings > Secrets and variables > Actions > New secret")
-    print("Need BOT_TOKEN and CHAT_ID")
-    exit(1)
-
-ok = send_text(f"🚀 <b>Test #36 - Bot Started</b>\nTime {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\nIf you see this, secrets are OK. Now scanning...")
-if not ok:
-    print("Telegram failed - check BOT_TOKEN/CHAT_ID")
-    exit(1)
-
-# If you get test message, continue scanning with simple version
 def ema(s,n): return s.ewm(span=n, adjust=False).mean()
-def rsi(s, p=14):
-    d=s.diff(); g=(d.where(d>0,0)).ewm(alpha=1/p, adjust=False).mean(); l=(-d.where(d<0,0)).ewm(alpha=1/p, adjust=False).mean()
-    return 100-(100/(1+g/l))
 
-def is_doji(o,h,l,c): return (h-l)>0 and abs(c-o)/(h-l) < 0.3
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def is_doji(o,h,l,c):
+    rng = h-l
+    return rng>0 and abs(c-o)/rng < 0.25
+
 def is_hammer(o,h,l,c):
-    b=abs(c-o); lo=min(o,c)-l; up=h-max(o,c)
-    return b>0 and lo>b*1.5 and up<b
+    body = abs(c-o)
+    if body==0: return False
+    lower = min(o,c)-l
+    upper = h-max(o,c)
+    return lower > body*1.8 and upper < body*0.8
 
-def is_bull(o,h,l,c): return is_doji(o,h,l,c) or is_hammer(o,h,l,c)
+def is_star(o,h,l,c):
+    body = abs(c-o)
+    rng = h-l
+    if rng==0: return False
+    upper = h-max(o,c)
+    lower = min(o,c)-l
+    return (upper > body*1.5 or lower > body*1.5) and body/rng < 0.4
 
-def scan(df):
-    if len(df)<70: return None
-    df=df.iloc[:-1].copy()
-    df['ema6']=ema(df['c'],6); df['ema12']=ema(df['c'],12); df['ema20']=ema(df['c'],20)
-    df['rsi']=rsi(df['c'],14); df['vm']=df['v'].rolling(20).mean()
-    for end in range(len(df)-1, len(df)-10, -1):
-        for ws in [2,3,4,5,6]:
-            s=end-ws+1; w=df.iloc[s:end+1]
-            low=w['l'].min(); low60=df.iloc[max(0,end-60):end]['l'].min()
-            if low>low60*1.15: continue
-            if (w['c']>w['o']).sum()<1: continue
-            if sum(is_bull(r['o'],r['h'],r['l'],r['c']) for _,r in w.iterrows())<1: continue
-            if w['rsi'].min()>50: continue
-            curr=df.iloc[end]['c']; sl=low*0.965; risk=curr-sl
-            if risk<=0: continue
-            return {'s':s,'e':end,'ws':ws,'bottom':low,'curr':curr,'sl':sl,'tp1':curr+risk*1.5,'tp2':curr+risk*2.8,'df':df,'rsi':df['rsi'].iloc[end]}
+def is_bullish_candle(o,h,l,c):
+    return is_doji(o,h,l,c) or is_hammer(o,h,l,c) or is_star(o,h,l,c)
+
+def scan_reversal(df):
+    if len(df) < 80: return None
+    df = df.iloc[:-1].copy()  # previous closed only
+    df['ema6'] = ema(df['c'],6)
+    df['ema12'] = ema(df['c'],12)
+    df['ema20'] = ema(df['c'],20)
+    df['rsi'] = rsi(df['c'],14)
+    df['vol_ma20'] = df['v'].rolling(20).mean()
+    
+    for end in range(len(df)-1, len(df)-8, -1):
+        for win_size in [2,3,4,5,6,7,8]:
+            start = end - win_size +1
+            if start < 10: continue
+            window = df.iloc[start:end+1]
+            
+            low_window = window['l'].min()
+            low_60 = df.iloc[max(0,end-60):end]['l'].min()
+            if low_window > low_60 * 1.08: continue  # must be at bottom/support/sweep
+            
+            ema_down = df['ema6'].iloc[end] < df['ema12'].iloc[end] and df['ema12'].iloc[end] < df['ema20'].iloc[end]*1.03
+            below_ema = (df['c'].iloc[end-15:end] < df['ema20'].iloc[end-15:end]).sum() >= 10
+            if not (ema_down or below_ema): continue
+            
+            green_cnt = (window['c'] > window['o']).sum()
+            if green_cnt < 1: continue
+            
+            bullish_cnt = sum(is_bullish_candle(r['o'],r['h'],r['l'],r['c']) for _,r in window.iterrows())
+            if bullish_cnt < 1: continue
+            
+            # === VOLUME FILTER ===
+            vol_window_avg = window['v'].mean()
+            vol_20_avg = df['vol_ma20'].iloc[end]
+            green_vols = [r['v'] for _,r in window.iterrows() if r['c']>r['o']]
+            max_green_vol = max(green_vols) if green_vols else 0
+            vol_exhaustion = vol_window_avg < vol_20_avg * 0.9
+            vol_spike_green = max_green_vol > vol_20_avg * 1.2
+            if not (vol_exhaustion or vol_spike_green): continue
+            
+            # === NEW RSI OVERSOLD FILTER ===
+            rsi_window = window['rsi'].min()
+            rsi_curr = df['rsi'].iloc[end]
+            # RSI must be oversold <35 at bottom like SAGA, VELVET, BLESS all at oversold
+            if rsi_window > 38 and rsi_curr > 40: continue  # not oversold enough
+            
+            curr_price = df.iloc[end]['c']
+            sl = low_window * 0.965
+            risk = curr_price - sl
+            if risk <=0: continue
+            tp1 = curr_price + risk*1.5
+            tp2 = curr_price + risk*2.8
+            tp3 = df['ema20'].iloc[end]
+            
+            return {
+                'end_idx': end, 'start_idx': start, 'win_size': win_size,
+                'bottom': low_window, 'curr': curr_price, 'green': int(green_cnt),
+                'bullish': int(bullish_cnt), 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
+                'ema6': df['ema6'].iloc[end], 'ema12': df['ema12'].iloc[end], 'ema20': df['ema20'].iloc[end],
+                'low_60': low_60, 'vol_avg': vol_window_avg, 'vol_ma20': vol_20_avg,
+                'vol_spike': vol_spike_green, 'rsi': rsi_curr, 'rsi_low': rsi_window, 'df': df
+            }
     return None
 
-def chart(res, sym, ex):
-    df=res['df'].tail(80); fig,ax=plt.subplots(figsize=(11,5))
-    for idx,row in df.iterrows():
-        col='#00b26a' if row['c']>=row['o'] else '#ff3b30'
-        ax.plot([idx,idx],[row['l'],row['h']],color=col,lw=1); ax.plot([idx,idx],[row['o'],row['c']],color=col,lw=3)
-    ax.plot(df.index,df['ema6'],color='#e38bd7',lw=1); ax.plot(df.index,df['ema12'],color='#f0a500',lw=1); ax.plot(df.index,df['ema20'],color='#5b4cff',lw=1.2)
-    ax.axvspan(res['s'],res['e'],color='lightgreen',alpha=0.3); ax.axhline(res['sl'],color='red',ls='--'); ax.axhline(res['tp2'],color='green',ls='-')
-    ax.set_title(f"{sym} {ex} 1D REVERSAL RSI{res['rsi']:.1f}"); ax.grid(alpha=0.2)
+def draw_chart(res, symbol, exchange):
+    df = res['df'].tail(90)
+    fig, (ax1, ax2, ax3) = plt.subplots(3,1, figsize=(11,7), gridspec_kw={'height_ratios':[3,1,1]}, sharex=True)
+    fig.patch.set_facecolor('white')
+    
+    for idx, row in df.iterrows():
+        color = '#00b26a' if row['c']>=row['o'] else '#ff3b30'
+        ax1.plot([idx, idx], [row['l'], row['h']], color=color, lw=1)
+        ax1.plot([idx, idx], [row['o'], row['c']], color=color, lw=3)
+    
+    ax1.plot(df.index, df['ema6'], color='#e38bd7', lw=1.1, label=f"EMA6:{res['ema6']:.5f}")
+    ax1.plot(df.index, df['ema12'], color='#f0a500', lw=1.1, label=f"EMA12:{res['ema12']:.5f}")
+    ax1.plot(df.index, df['ema20'], color='#5b4cff', lw=1.2, label=f"EMA20:{res['ema20']:.5f}")
+    ax1.axvspan(res['start_idx'], res['end_idx'], color='lightgreen', alpha=0.35)
+    ax1.axhline(res['sl'], color='red', ls='--', lw=1.2, label=f"SL {res['sl']:.6f}")
+    ax1.axhline(res['tp1'], color='#00b26a', ls=':', lw=1, label=f"TP1")
+    ax1.axhline(res['tp2'], color='#00b26a', ls='-', lw=1.2, label=f"TP2 {res['tp2']:.6f}")
+    
+    ax1.set_title(f"{symbol} {exchange} 1D REVERSAL {res['win_size']}c RSI{res['rsi']:.1f} Green{res['green']}", fontsize=11, fontweight='bold')
+    ax1.legend(fontsize=7, loc='upper left')
+    ax1.grid(alpha=0.2)
+    
+    colors = ['#00b26a' if c>=o else '#ff3b30' for c,o in zip(df['c'], df['o'])]
+    ax2.bar(df.index, df['v'], color=colors, alpha=0.7)
+    ax2.plot(df.index, df['vol_ma20'], color='#e38bd7', lw=1)
+    ax2.set_ylabel("VOL"); ax2.grid(alpha=0.2)
+    
+    ax3.plot(df.index, df['rsi'], color='#5b4cff', lw=1.2)
+    ax3.axhline(35, color='red', ls='--', lw=0.8, label='Oversold 35')
+    ax3.axhline(70, color='green', ls='--', lw=0.8, label='Overbought 70')
+    ax3.fill_between(df.index, 0, 35, color='lightgreen', alpha=0.2)
+    ax3.set_ylabel("RSI14"); ax3.legend(fontsize=6); ax3.grid(alpha=0.2)
+    plt.tight_layout()
     return fig
 
-def send_photo(fig, cap):
-    try:
-        buf=io.BytesIO(); fig.savefig(buf,format='png',dpi=150,bbox_inches='tight'); buf.seek(0); plt.close(fig)
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", data={"chat_id":CHAT_ID,"caption":cap,"parse_mode":"HTML"}, files={"photo":buf}, timeout=20)
-    except Exception as e: print(f"photo fail {e}")
+def main():
+    exchanges = [
+        ('MEXC', ccxt.mexc({'enableRateLimit':True, 'options':{'defaultType':'swap'}})),
+        ('BYBIT', ccxt.bybit({'enableRateLimit':True, 'options':{'defaultType':'swap'}})),
+        ('OKX', ccxt.okx({'enableRateLimit':True, 'options':{'defaultType':'swap'}})),
+        ('BITGET', ccxt.bitget({'enableRateLimit':True, 'options':{'defaultType':'swap'}})),
+        ('GATE', ccxt.gate({'enableRateLimit':True, 'options':{'defaultType':'swap'}})),
+    ]
+    total=0
+    for ex_name, ex in exchanges:
+        try:
+            ex.load_markets()
+            syms = [s for s in ex.markets if s.endswith('/USDT:USDT') and 'STOCK' not in s and 'ETF' not in s][:700]
+            send_text(f"🔍 {ex_name} {len(syms)} perps 1D reversal + Vol + RSI<35")
+            for sym in syms:
+                try:
+                    ohlcv = ex.fetch_ohlcv(sym, '1D', limit=120)
+                    df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+                    res = scan_reversal(df)
+                    if res:
+                        clean = sym.replace('/USDT:USDT','')
+                        fig = draw_chart(res, clean, ex_name)
+                        rr = (res['tp2']-res['curr'])/(res['curr']-res['sl'])
+                        vol_text = "Spike" if res['vol_spike'] else "Exhaustion"
+                        caption = f"🔥 <b>{clean} {ex_name} 1D BOTTOM</b>\n{res['win_size']} candles | Green:{res['green']} Bullish:{res['bullish']} Doji/Hammer/Star\nPrice: {res['curr']:.6f} Bottom: {res['bottom']:.6f}\nEMA6 {res['ema6']:.5f} EMA12 {res['ema12']:.5f} EMA20 {res['ema20']:.5f}\n📊 Vol {vol_text} RSI {res['rsi']:.1f} (Low {res['rsi_low']:.1f}) Oversold <35 ✅\n<b>SL:</b> {res['sl']:.6f} <b>TP1:</b> {res['tp1']:.6f} (1.5R) <b>TP2:</b> {res['tp2']:.6f} (2.8R)\nRR 1:{rr:.1f} | {datetime.utcnow().strftime('%Y-%m-%d')}"
+                        send_photo(fig, caption)
+                        total+=1
+                        time.sleep(1.3)
+                    time.sleep(0.07)
+                except: time.sleep(0.3); continue
+        except Exception as e:
+            send_text(f"⚠️ {ex_name} {e}"); continue
+    send_text(f"✅ Done - Found {total} reversal setups Vol + RSI<35 like your photos")
 
-exchanges=[('MEXC',ccxt.mexc({'enableRateLimit':True,'options':{'defaultType':'swap'}})),('BYBIT',ccxt.bybit({'enableRateLimit':True,'options':{'defaultType':'swap'}}))]
-total=0; scanned=0
-for exn,ex in exchanges:
-    try:
-        ex.load_markets(); syms=[s for s in ex.markets if s.endswith('/USDT:USDT')][:400]
-        for sym in syms:
-            try:
-                ohlcv=ex.fetch_ohlcv(sym,'1D',limit=90); df=pd.DataFrame(ohlcv,columns=['t','o','h','l','c','v']); scanned+=1
-                res=scan(df)
-                if res:
-                    clean=sym.replace('/USDT:USDT',''); fig=chart(res,clean,exn)
-                    rr=(res['tp2']-res['curr'])/(res['curr']-res['sl']); cap=f"🔥 <b>{clean} {exn} 1D BOTTOM</b>\nRSI {res['rsi']:.1f} Price {res['curr']:.6f} SL {res['sl']:.6f} TP2 {res['tp2']:.6f} RR 1:{rr:.1f}"
-                    send_photo(fig,cap); total+=1; time.sleep(1)
-            except: time.sleep(0.2); continue
-    except Exception as e: print(f"{exn} err {e}"); continue
-
-send_text(f"✅ Done - Scanned {scanned} pairs - Found {total} reversal")
+if __name__ == "__main__": main()
