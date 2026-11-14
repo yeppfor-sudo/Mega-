@@ -6,7 +6,9 @@ import pandas as pd
 import requests
 import matplotlib
 matplotlib.use("Agg")
-import mplfinance as mpf
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter
 
 BASE = "https://contract.mexc.com/api/v1/contract"
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -14,12 +16,12 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 TFS = {"1d": 1, "2d": 2, "3d": 3, "5d": 5, "7d": 7}
 MIN_SCORE = int(os.environ.get("MIN_SCORE", "70"))
-MIN_DRAWDOWN = float(os.environ.get("MIN_DRAWDOWN", "0.55"))   # 55% crash from peak
-MIN_AVG_TURNOVER = float(os.environ.get("MIN_TURNOVER", "20000"))  # USDT/day
+MIN_DRAWDOWN = float(os.environ.get("MIN_DRAWDOWN", "0.55"))
+MIN_AVG_TURNOVER = float(os.environ.get("MIN_TURNOVER", "20000"))
 INCLUDE_STOCKS = os.environ.get("INCLUDE_STOCKS", "0") == "1"
+WATERMARK = os.environ.get("WATERMARK", "MEXC")
 STATE_FILE = "sent.json"
 
-# stocks / ETFs / metals / indices that must be skipped for crypto-only mode
 NON_CRYPTO = {
     "XAU", "XAG", "GOLD", "SILVER", "OIL", "USOIL", "UKOIL", "SPY", "QQQ", "IWM",
     "TSLA", "NVDA", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NFLX", "AMD",
@@ -31,6 +33,13 @@ NON_CRYPTO = {
 
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0"})
+
+# ---------- MEXC style colors ----------
+UP = "#14B375"
+DN = "#F2495D"
+C_E6 = "#F0B90B"
+C_E12 = "#B05CF0"
+C_E20 = "#3B82F6"
 
 
 def get_json(url, params=None, tries=4):
@@ -129,7 +138,7 @@ def analyze(c):
     if drawdown < MIN_DRAWDOWN or bars_since_peak < 15:
         return None
 
-    t = c.iloc[-1]       # trigger = last closed candle
+    t = c.iloc[-1]
     p = c.iloc[-2]
     green = t["Close"] > t["Open"]
     above_all = t["Close"] > max(t["e6"], t["e12"], t["e20"])
@@ -149,7 +158,7 @@ def analyze(c):
     strong = (body / t["Close"] >= 0.04) or (avg_body > 0 and body >= 1.5 * avg_body)
     not_pumped = t["Close"] <= base_low * 1.8
 
-    score = 20 + 10 + 20  # crash + green above EMAs + fresh cross
+    score = 20 + 10 + 20
     score += 15 if flat else 0
     score += 15 if converged else 0
     score += 10 if near_lows else 0
@@ -169,22 +178,135 @@ def analyze(c):
     }
 
 
+# ---------- MEXC style chart ----------
+def fmt_price(x):
+    ax_ = abs(x)
+    if ax_ >= 1000:
+        return f"{x:,.2f}"
+    if ax_ >= 1:
+        return f"{x:.4f}"
+    if ax_ >= 0.01:
+        return f"{x:.5f}"
+    if ax_ >= 0.0001:
+        return f"{x:.6f}"
+    return f"{x:.8f}"
+
+
 def make_chart(all_df, trig_idx, sym, tf):
-    df = add_emas(all_df.copy()).iloc[-90:]
-    mk = pd.Series(np.nan, index=df.index)
-    if trig_idx in mk.index:
-        mk.loc[trig_idx] = df.loc[trig_idx, "Low"] * 0.93
-    aps = [
-        mpf.make_addplot(df["e6"], color="#00e5ff", width=1),
-        mpf.make_addplot(df["e12"], color="#ffd600", width=1),
-        mpf.make_addplot(df["e20"], color="#ff4081", width=1.2),
-        mpf.make_addplot(mk, type="scatter", marker="^", markersize=140, color="lime"),
-    ]
-    style = mpf.make_mpf_style(base_mpf_style="nightclouds", gridstyle=":")
+    df = add_emas(all_df.copy()).iloc[-70:]
+    n = len(df)
+    x = np.arange(n)
+    o = df["Open"].values
+    h = df["High"].values
+    l = df["Low"].values
+    c = df["Close"].values
+    v = df["Volume"].values
+    col = np.where(c >= o, UP, DN)
+
+    fig = plt.figure(figsize=(7.5, 9), dpi=120, facecolor="white")
+    gs = fig.add_gridspec(2, 1, height_ratios=[4.4, 1], hspace=0.03,
+                          left=0.02, right=0.86, top=0.855, bottom=0.05)
+    ax = fig.add_subplot(gs[0])
+    axv = fig.add_subplot(gs[1], sharex=ax)
+    for a in (ax, axv):
+        a.set_facecolor("white")
+        for s in a.spines.values():
+            s.set_visible(False)
+        a.grid(True, color="#EEF0F3", lw=0.8)
+        a.set_axisbelow(True)
+
+    # ----- header: timeframe tabs like MEXC -----
+    tabs = ["1D", "2D", "3D", "5D", "7D"]
+    active = tf.upper()
+    for i, t in enumerate(tabs):
+        xx = 0.09 + i * 0.15
+        is_act = (t == active)
+        fig.text(xx, 0.955, t, ha="center", va="center", fontsize=15,
+                 color="#111111" if is_act else "#8A919E",
+                 weight="bold" if is_act else "normal")
+        if is_act:
+            fig.add_artist(Line2D([xx - 0.035, xx + 0.035], [0.932, 0.932],
+                                  color="#1F6FEB", lw=2.5, transform=fig.transFigure))
+    fig.add_artist(Line2D([0, 1], [0.928, 0.928], color="#E6E8EB", lw=1,
+                          transform=fig.transFigure))
+
+    fig.text(0.03, 0.902, sym.replace("_", "") + "  Perpetual", fontsize=14,
+             weight="bold", color="#111111", va="center")
+    chg = (c[-1] / o[-1] - 1) * 100
+    fig.text(0.97, 0.902, f"{fmt_price(c[-1])}  {chg:+.2f}%", fontsize=11,
+             weight="bold", color=UP if chg >= 0 else DN, va="center", ha="right")
+    fig.text(0.03, 0.874, f"EMA6: {fmt_price(df['e6'].iloc[-1])}", fontsize=8.5,
+             color=C_E6, va="center")
+    fig.text(0.31, 0.874, f"EMA12: {fmt_price(df['e12'].iloc[-1])}", fontsize=8.5,
+             color=C_E12, va="center")
+    fig.text(0.60, 0.874, f"EMA20: {fmt_price(df['e20'].iloc[-1])}", fontsize=8.5,
+             color=C_E20, va="center")
+
+    # ----- candles -----
+    rng = max(h.max() - l.min(), 1e-12)
+    ax.vlines(x, l, h, colors=col, linewidth=1.1, zorder=2)
+    body_h = np.maximum(np.abs(c - o), rng * 0.002)
+    ax.bar(x, body_h, bottom=np.minimum(o, c), width=0.72, color=col, zorder=3)
+
+    ax.plot(x, df["e6"].values, color=C_E6, lw=1.1, zorder=4)
+    ax.plot(x, df["e12"].values, color=C_E12, lw=1.1, zorder=4)
+    ax.plot(x, df["e20"].values, color=C_E20, lw=1.2, zorder=4)
+
+    pad = rng * 0.10
+    ax.set_ylim(l.min() - pad, h.max() + pad)
+    ax.set_xlim(-1, n + 4)
+
+    # watermark
+    ax.text(0.55, 0.52, WATERMARK, transform=ax.transAxes, fontsize=58, weight="bold",
+            color="#9AA0A6", alpha=0.18, ha="center", va="center", zorder=0)
+
+    # ----- high / low labels (like MEXC) -----
+    hi_i, lo_i = int(np.argmax(h)), int(np.argmin(l))
+    for i, val in ((hi_i, h[hi_i]), (lo_i, l[lo_i])):
+        dx = 5 if i < n - 14 else -5
+        ax.annotate(fmt_price(val), xy=(i, val), xytext=(i + dx, val),
+                    ha="left" if dx > 0 else "right", va="center",
+                    fontsize=9, color="#222222", zorder=6,
+                    arrowprops=dict(arrowstyle="-", color="#8A919E", lw=0.9,
+                                    shrinkA=2, shrinkB=0))
+
+    # ----- signal marker on trigger candle -----
+    if trig_idx in df.index:
+        pos = df.index.get_loc(trig_idx)
+        ax.scatter([pos], [l[pos] - pad * 0.55], marker="^", s=110, color=UP,
+                   edgecolors="white", linewidths=0.8, zorder=7)
+        ax.text(pos, l[pos] - pad * 0.95, "SIGNAL", ha="center", va="top",
+                fontsize=7.5, color=UP, weight="bold", zorder=7)
+
+    # ----- last price line + tag -----
+    last_col = UP if c[-1] >= o[-1] else DN
+    ax.axhline(c[-1], color=last_col, ls="--", lw=0.9, zorder=1)
+    ax.text(1.005, c[-1], fmt_price(c[-1]), transform=ax.get_yaxis_transform(),
+            va="center", ha="left", fontsize=8.5, color="white", zorder=9,
+            clip_on=False,
+            bbox=dict(boxstyle="square,pad=0.28", fc=last_col, ec="none"))
+
+    # ----- axes style -----
+    ax.yaxis.tick_right()
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda val, _: fmt_price(val)))
+    ax.tick_params(axis="y", colors="#8A919E", labelsize=8, length=0)
+    ax.tick_params(axis="x", labelbottom=False, length=0)
+
+    # ----- volume -----
+    axv.bar(x, v, color=col, width=0.72, alpha=0.9)
+    axv.set_ylim(0, max(v.max(), 1e-12) * 1.25)
+    axv.set_yticks([])
+    axv.text(0.01, 0.88, "Vol", transform=axv.transAxes, fontsize=8, color="#8A919E",
+             va="top")
+    step = max(n // 5, 1)
+    ticks = list(range(0, n, step))
+    axv.set_xticks(ticks)
+    axv.set_xticklabels([df.index[i].strftime("%m-%d") for i in ticks])
+    axv.tick_params(axis="x", colors="#8A919E", labelsize=8, length=0)
+
     buf = io.BytesIO()
-    mpf.plot(df[["Open", "High", "Low", "Close", "Volume"]], type="candle", style=style,
-             addplot=aps, volume=True, title=f"{sym}  {tf}  (live)",
-             savefig=dict(fname=buf, dpi=110, format="png"), figsize=(9, 6))
+    fig.savefig(buf, format="png", facecolor="white")
+    plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
 
@@ -261,7 +383,6 @@ def main():
             print("chart error", sym, e)
             continue
         tfs = ", ".join(h["tf"] for h in new)
-        base = sym.replace("_USDT", "")
         cap = (f"🟢 <b>{sym}</b> — bottom reversal\n"
                f"Timeframes: {tfs}\n"
                f"Score: {best['score']}/100 ({best['tf']})\n"
